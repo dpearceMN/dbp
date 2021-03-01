@@ -10,11 +10,14 @@ use App\Http\Controllers\APIController;
 use App\Models\Bible\Bible;
 use App\Models\Bible\BibleFileset;
 use App\Models\Bible\BibleFile;
+use App\Models\Bible\BibleVerse;
 use App\Models\Bible\BibleFilesetType;
 use App\Models\Bible\Book;
 use App\Models\Language\Language;
 
 use App\Transformers\FileSetTransformer;
+use App\Transformers\TextTransformer;
+
 use Illuminate\Http\Request;
 
 class BibleFileSetsController extends APIController
@@ -52,24 +55,30 @@ class BibleFileSetsController extends APIController
      *     )
      * )
      *
-     * @param null $id
+     * @param string|null $fileset_url_param
+     * @param string|null $book_url_param
+     * @param string|null $chapter_url_param
      *
      * @return \Illuminate\Contracts\View\Factory|\Illuminate\View\View|mixed
      * @throws \Exception
      */
-    public function show($id = null, $asset_id = null, $set_type_code = null, $cache_key = 'bible_filesets_show')
+    public function show($fileset_url_param = null, $book_url_param = null, $chapter_url_param = null, $asset_id = null, $set_type_code = null, $cache_key = 'bible_filesets_show')
     {
-        $fileset_id    = checkParam('dam_id|fileset_id', true, $id);
-        $book_id       = checkParam('book_id');
-        $chapter_id    = checkParam('chapter_id|chapter');
+        $fileset_id    = checkParam('dam_id|fileset_id', true, $fileset_url_param);
+        $book_id     = checkParam('book_id', false, $book_url_param);
+        $chapter_id    = checkParam('chapter_id|chapter', false, $chapter_url_param);
+        $verse_start = checkParam('verse_start') ?? 1;
+        $verse_end   = checkParam('verse_end');
         $asset_id      = checkParam('bucket|bucket_id|asset_id', false, $asset_id) ?? config('filesystems.disks.s3_fcbh.bucket');
-        $type          = checkParam('type', $set_type_code !== null, $set_type_code);
+        $type          = checkParam('type', $set_type_code !== null, $set_type_code) ?? 'text_plain';
 
-        $cache_params = [$this->v, $fileset_id, $book_id, $type, $chapter_id, $asset_id];
+        $cache_params = [$this->v, $fileset_id, $book_id, $type, $chapter_id, $asset_id, $verse_start, $verse_end];
 
-        $fileset_chapters = cacheRemember($cache_key, $cache_params, now()->addHours(12), function () use ($fileset_id, $book_id, $type, $chapter_id, $asset_id) {
+        $fileset_chapters = cacheRemember($cache_key, $cache_params, now()->addHours(12), function () use ($fileset_id, $book_id, $type, $chapter_id, $asset_id, $verse_start, $verse_end) {
             $book = Book::where('id', $book_id)->orWhere('id_osis', $book_id)->orWhere('id_usfx', $book_id)->first();
+            
             $fileset = BibleFileset::with('bible')->uniqueFileset($fileset_id, $asset_id, $type)->first();
+  
             if (!$fileset) {
                 return $this->setStatusCode(404)->replyWithError(trans('api.bible_fileset_errors_404'));
             }
@@ -80,7 +89,37 @@ class BibleFileSetsController extends APIController
             }
 
             $bible = optional($fileset->bible)->first();
-            $query = BibleFile::where('hash_id', $fileset->hash_id)
+
+            $text_query = BibleVerse::withVernacularMetaData($bible)
+                ->where('hash_id', $fileset->hash_id)
+                ->when($book_id, function ($query) use ($book_id) {
+                    return $query->where('bible_verses.book_id', $book_id);
+                })
+                ->when($verse_start, function ($query) use ($verse_start) {
+                    return $query->where('verse_end', '>=', $verse_start);
+                })
+                ->when($chapter_id, function ($query) use ($chapter_id) {
+                    return $query->where('chapter', $chapter_id);
+                })
+                ->when($verse_end, function ($query) use ($verse_end) {
+                    return $query->where('verse_end', '<=', $verse_end);
+                })
+                ->orderBy('verse_start')
+                ->select([
+                    'bible_verses.book_id as book_id',
+                    'books.name as book_name',
+                    'books.protestant_order as book_order',
+                    'bible_books.name as book_vernacular_name',
+                    'bible_verses.chapter',
+                    'bible_verses.verse_start',
+                    'bible_verses.verse_end',
+                    'bible_verses.verse_text',
+                    'glyph_chapter.glyph as chapter_vernacular',
+                    'glyph_start.glyph as verse_start_vernacular',
+                    'glyph_end.glyph as verse_end_vernacular',
+                ]);
+            
+            $non_text_query = BibleFile::where('hash_id', $fileset->hash_id)
                 ->leftJoin(config('database.connections.dbp.database') . '.bible_books', function ($q) use ($bible) {
                     $q->on('bible_books.book_id', 'bible_files.book_id')->where('bible_books.bible_id', $bible->id);
                 })
@@ -104,19 +143,28 @@ class BibleFileSetsController extends APIController
                     'books.protestant_order as book_order'
                 ]);
 
+            $query = ($type === 'text_plain') ? $text_query : $non_text_query;
+            
             if ($type === 'video_stream') {
                 $query->orderByRaw("FIELD(bible_files.book_id, 'MAT', 'MRK', 'LUK', 'JHN') ASC")
                     ->orderBy('chapter_start', 'ASC')
                     ->orderBy('verse_start', 'ASC');
             }
-
+            
             $fileset_chapters = $query->get();
 
             if ($fileset_chapters->count() === 0) {
                 return $this->setStatusCode(404)->replyWithError('No Fileset Chapters Found for the provided params');
             }
 
-            return fractal($this->generateFilesetChapters($fileset, $fileset_chapters, $bible, $asset_id), new FileSetTransformer(), $this->serializer);
+            if ($type === 'text_plain') {
+                $transformer = new TextTransformer();
+            } else {
+                $transformer = new FileSetTransformer();
+                $fileset_chapters = $this->generateFilesetChapters($fileset, $fileset_chapters, $bible, $asset_id);
+            }
+
+            return fractal($fileset_chapters, $transformer, $this->serializer);
         });
 
 

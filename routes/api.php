@@ -40,7 +40,7 @@ Route::name('v4_internal_filesets.store')->post('bibles/filesets',             '
 Route::name('v4_filesets.books')->get('bibles/filesets/{fileset_id}/books',        'Bible\BooksController@show');
 
 // VERSION 4 | Text
-Route::name('v4_filesets.chapter')->get('bibles/filesets/{fileset_id}/{book}/{chapter}', 'Bible\TextController@index');
+Route::name('v4_filesets.chapter')->get('bibles/filesets/{fileset_id}/{book}/{chapter}', 'Bible\BibleFilesetsController@show');
 Route::name('v4_text_search')->get('search',                                             'Bible\TextController@search');
 Route::name('v4_internal_library_search')->middleware('APIToken:check')->get('search/library',    'Bible\TextController@searchLibrary');
 
